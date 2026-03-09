@@ -1,0 +1,737 @@
+---
+title: "Clasificador multiclase de objetos a partir de datos radar 2D"
+author: "Juan Andres Torres Negreira"
+output: html_document
+date: "2025-10-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r librerias, warning=FALSE, message=FALSE}
+
+library(dplyr)
+library(ggplot2)
+library(randomForest)
+library(PRROC)
+library(caret)
+library(ranger)
+library(tidyr)
+
+```
+
+## Descripción del proyecto
+
+Este trabajo implementa un clasificador multiclase de objetos a partir de datos de un radar 2D (*Radar Detection Interface*, RDI). Para cada detección del sensor se predicen 6 categorías de objetos usando un modelo de Random Forest entrenado con las señales físicas del radar.
+
+**Objetivo:** construir un clasificador capaz de distinguir entre distintos tipos de objetos presentes en el entorno de un vehículo, a partir de las mediciones brutas del radar.
+
+**Clases detectadas** (tras reasignación de etiquetas):
+
+| Código | Clase                                      |
+|:------:|:------------------------------------------:|
+| 0      | Coche                                      |
+| 1      | Vehículo grande (incluye camión y autobús) |
+| 5      | Bicicleta                                  |
+| 7      | Persona (incluye grupo de personas)        |
+| 10     | Otro objeto dinámico                       |
+| 11     | Background estático                        |
+
+**Variables explicativas** (salida del sensor radar):
+
+| Variable | Descripción | Unidad |
+|:----------------------:|:----------------------:|:----------------------:|
+| `range_sc` | Distancia radial a la detección (coord. relativas al sensor) | m |
+| `azimuth_sc` | Ángulo de azimut a la detección | rad |
+| `radar_cross_section` | Radar Cross Section (RCS) de la detección | dBsm |
+| `radial_velocity` | Velocidad radial medida | m/s |
+| `vr_compensated` | Velocidad radial compensada por movimiento del ego-vehículo | m/s |
+| `x_cc` | Posición X en coord. relativas al ego-vehículo | m |
+| `y_cc` | Posición Y en coord. relativas al ego-vehículo | m |
+| `x_seq` | Posición X en coord. globales | m |
+| `y_seq` | Posición Y en coord. globales | m |
+
+**Simplificación adoptada:** cada detección (registro) se trata como un objeto independiente.
+
+**Estructura del análisis:**
+
+1.  Carga de datos y reasignación de etiquetas
+2.  Separación train / validación (200k registros cada uno)
+3.  Análisis exploratorio del RCS por clase y distancia
+4.  Entrenamiento de Random Forest multiclase y cálculo de AP y mAP
+5.  Evaluación del AP por subgrupos de distancia y azimuth
+6.  Selección del umbral de operación para la clase Persona (7) y validación
+
+> **Nota:** los datos no se incluyen en el repositorio. El notebook se comparte únicamente como referencia del análisis realizado.
+
+## Parte 1: Cargar los datos
+
+```{r, warning=FALSE, message=FALSE}
+
+load("Entregable2.RData")
+
+```
+
+## Parte 2: Reasignar etiquetas
+
+```{r, warning=FALSE, message=FALSE}
+
+# Reasignar etiquetas en y
+y2 <- y
+
+# Autobús (3) y camión (2) → vehículo grande (1)
+y2[y2 %in% c(2, 3)] <- 1
+
+# Grupo de personas (8) → persona (7)
+y2[y2 == 8] <- 7
+
+```
+
+## Parte 3: Separar los datos
+
+```{r, warning=FALSE, message=FALSE}
+
+# Train: primeros 200,000 registros
+X_train <- X[1:200000, ]
+y_train <- y2[1:200000]
+
+# Validation: siguientes 200,000 registros
+X_valid <- X[200001:400000, ]
+y_valid <- y2[200001:400000]
+
+```
+
+## Parte 4: Grafica de RCS para las clases 7 y 1
+
+```{r, warning=FALSE, message=FALSE}
+
+# Crear data frame de entrenamiento con las variables necesarias
+train_df <- data.frame(
+  range_sc = X_train[, "range_sc"],
+  radar_cross_section = X_train[, "radar_cross_section"],
+  clase = y_train
+)
+
+# Filtrar solo clases Persona (7) y Vehículo grande (1)
+train_sub <- train_df %>%
+  filter(clase %in% c(1, 7))
+
+# Crear bins de distancia (por ejemplo, cada 2 metros)
+train_sub <- train_sub %>%
+  mutate(bin_range = cut(range_sc, breaks = seq(0, max(range_sc, na.rm = TRUE), by = 2)))
+
+# Calcular mediana y MAD del RCS por clase y rango
+rcs_stats <- train_sub %>%
+  group_by(clase, bin_range) %>%
+  summarise(
+    range_med = median(range_sc, na.rm = TRUE),
+    RCS_mediana = median(radar_cross_section, na.rm = TRUE),
+    RCS_mad = mad(radar_cross_section, constant = 1, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+```{r, warning=FALSE, message=FALSE}
+
+# Graficar mediana ± MAD para cada clase
+ggplot(rcs_stats, aes(x = range_med, y = RCS_mediana, color = factor(clase), fill = factor(clase))) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymin = RCS_mediana - RCS_mad, ymax = RCS_mediana + RCS_mad), alpha = 0.2, color = NA) +
+  labs(
+    title = "Radar Cross Section (RCS) mediana ± MAD en función de la distancia",
+    x = "Distancia radial (m)",
+    y = "RCS (dBsm)",
+    color = "Clase",
+    fill = "Clase"
+  ) +
+  scale_color_manual(values = c("1" = "#1B9E77", "7" = "#D95F02"),
+                     labels = c("Vehículo grande", "Persona")) +
+  scale_fill_manual(values = c("1" = "#1B9E77", "7" = "#D95F02"),
+                    labels = c("Vehículo grande", "Persona")) +
+  theme_minimal(base_size = 13)
+
+```
+
+### ¿Existe diferencia significativa en términos de RCS entre la clase Persona (7) y Vehículo grande (1)?
+
+Visualmente pareceria que existe una diferencia significativa entre ambas clases. Teniendo en cuenta que el RCS probablemente no sigue una distribución normal (suele ser asimétrico y con outliers), y tenemos muestras muy grandes, pondremos a prueba la diferencia entre clases con un test de Wilcoxon.
+
+```{r, warning=FALSE, message=FALSE}
+
+# Extraer RCS por clase
+rcs_persona <- train_df$radar_cross_section[y_train == 7]
+rcs_vehiculo <- train_df$radar_cross_section[y_train == 1]
+
+# Prueba no paramétrica de Mann-Whitney (Wilcoxon rank-sum)
+test_rcs <- wilcox.test(rcs_persona, rcs_vehiculo)
+
+# Mostrar resultados
+test_rcs
+
+```
+
+El p-value del test indica que hay una diferencia estadísticamente significativa en los valores de RCS entre personas y vehículos grandes.
+
+## Parte 5: Generar modelo multiclase de objetos y obtener el Average Precision
+
+### Modelo: Random Forest con `ranger`
+
+Se entrena un Random Forest multiclase con las siguientes decisiones de diseño:
+
+-   **Muestreo del training:** 20.000 registros (limitación de recursos computacionales)
+-   **Preprocesado:** estandarización (*center + scale*) de todas las variables
+-   **Hiperparámetros:** 200 árboles, profundidad máxima 12, 3 variables por split (`mtry`)
+-   **Probabilidades:** el modelo devuelve probabilidades por clase para calcular curvas PR
+
+La métrica de evaluación principal es el **AP (Average Precision)** por clase vs. resto y el **mAP (mean Average Precision)** global.
+
+```{r, warning=FALSE, message=FALSE}
+
+#Muestreo del set de entrenamiento
+
+set.seed(123)
+N_train_sample <- 20000  # ajustable según recursos
+idx_sample <- sample(1:nrow(X_train), N_train_sample)
+
+X_sample <- X_train[idx_sample, ]
+y_sample <- y_train[idx_sample]
+
+```
+
+```{r, warning=FALSE, message=FALSE}
+# Preparar dataframe
+
+train_df <- as.data.frame(X_sample)
+train_df$clase <- y_sample
+
+valid_df <- as.data.frame(X_valid)
+valid_df$clase <- y_valid
+
+```
+
+```{r, warning=FALSE, message=FALSE}
+# Escalado de variables
+
+preproc <- preProcess(train_df[, -which(names(train_df) == "clase")],
+                      method = c("center", "scale"))
+
+train_scaled <- predict(preproc, train_df[, -which(names(train_df) == "clase")])
+train_scaled$clase <- as.factor(train_df$clase)
+
+valid_scaled <- predict(preproc, valid_df[, -which(names(valid_df) == "clase")])
+valid_scaled$clase <- as.factor(valid_df$clase)
+
+```
+
+```{r, warning=FALSE, message=FALSE}
+# Entrenamiento del Random Forest
+
+set.seed(42)
+modelo_rf <- ranger(
+  formula = clase ~ .,
+  data = train_scaled,
+  num.trees = 200,        # cantidad de árboles
+  max.depth = 12,         # profundidad máxima
+  importance = "impurity",
+  probability = TRUE,     # para obtener probabilidades
+  num.threads = parallel::detectCores(), # usar todos los cores
+  seed = 42
+)
+
+```
+
+```{r, warning=FALSE, message=FALSE}
+# Predicciones
+
+pred_train <- predict(modelo_rf, train_scaled)$predictions
+pred_valid <- predict(modelo_rf, valid_scaled)$predictions
+
+```
+
+```{r, warning=FALSE, message=FALSE}
+# Cálculo de AP por clase y mAP
+
+# Función auxiliar para Average Precision
+calcular_AP <- function(probs, y_true, clase_objetivo) {
+  etiqueta_binaria <- as.numeric(y_true == clase_objetivo)
+  if (sum(etiqueta_binaria) == 0) return(NA)  # evita errores si clase ausente
+  pr <- pr.curve(
+    scores.class0 = probs[, clase_objetivo],
+    weights.class0 = etiqueta_binaria,
+    curve = FALSE
+  )
+  return(pr$auc.integral)
+}
+
+clases <- levels(train_scaled$clase)
+
+# AP y mAP en entrenamiento
+AP_train <- sapply(clases, function(clase)
+  calcular_AP(pred_train, train_scaled$clase, clase))
+mAP_train <- mean(AP_train, na.rm = TRUE)
+
+# AP y mAP en validación
+AP_valid <- sapply(clases, function(clase)
+  calcular_AP(pred_valid, valid_scaled$clase, clase))
+mAP_valid <- mean(AP_valid, na.rm = TRUE)
+
+```
+
+```{r, warning=FALSE, message=FALSE}
+
+cat("=== AP por clase (Entrenamiento) ===\n")
+print(AP_train)
+cat("\nMean AP (mAP) Entrenamiento:", round(mAP_train, 4), "\n\n")
+
+cat("=== AP por clase (Validación) ===\n")
+print(AP_valid)
+cat("\nMean AP (mAP) Validación:", round(mAP_valid, 4), "\n")
+
+```
+
+### Resultados de AP y mAP
+
+| Conjunto | mAP |
+|:-:|:-:|
+| Entrenamiento | 0.9488 |
+| Validación | 0.4399 |
+
+La diferencia entre train y validación indica sobreajuste, atribuible principalmente
+al muestreo reducido del set de entrenamiento (20k vs 200k registros de validación).
+La clase con mejor AP en validación es Persona (7) con 0.882, mientras que
+Otro objeto dinámico (10) presenta el AP más bajo (0.021).
+
+## Parte 6: Evaluación de valores de AP según distancia y ángulos
+
+### Dividir la distancia y el azimuth usando X_train
+
+```{r, warning=FALSE, message=FALSE}
+
+# Calcular mediana de distance en entrenamiento
+range_med <- median(X_train[idx_sample, "range_sc"], na.rm = TRUE)
+
+# Dividir distancia en 2 grupos en entrenamiento y validación
+train_scaled$range_cat <- ifelse(
+  X_train[idx_sample, "range_sc"] <= range_med,
+  "corta",
+  "larga"
+)
+
+valid_scaled$range_cat <- ifelse(
+  X_valid[, "range_sc"] <= range_med,
+  "corta",
+  "larga"
+)
+
+# Dividir azimuth en 2 grupos en entrenamiento y validación
+train_scaled$azimuth_cat <- ifelse(
+  abs(X_train[idx_sample, "azimuth_sc"]) <= 0.2,
+  "centrado",
+  "lateral"
+)
+
+valid_scaled$azimuth_cat <- ifelse(
+  abs(X_valid[, "azimuth_sc"]) <= 0.2,
+  "centrado",
+  "lateral"
+)
+
+```
+
+### Definir función para calcular AP por clase
+
+```{r, warning=FALSE, message=FALSE}
+
+calcular_AP_grupo <- function(probs, y_true, clases) {
+  sapply(clases, function(clase) {
+    etiqueta_binaria <- as.numeric(y_true == clase)
+    if (sum(etiqueta_binaria) == 0) return(NA)
+    pr <- pr.curve(
+      scores.class0 = probs[, clase],
+      weights.class0 = etiqueta_binaria,
+      curve = FALSE
+    )
+    return(pr$auc.integral)
+  })
+}
+
+```
+
+### AP por clase según distancia (evaluando con validación)
+
+```{r, warning=FALSE, message=FALSE}
+
+clases <- levels(train_scaled$clase)
+
+# Crear lista para AP por distancia
+ap_distancia <- list()
+
+for (dist in c("corta", "larga")) {
+  idx <- which(valid_scaled$range_cat == dist)
+  
+  if (length(idx) > 0) {
+    probs_subset <- pred_valid[idx, ]      # usamos el set de validación
+    y_subset <- valid_scaled$clase[idx]
+    
+    ap_vals <- calcular_AP_grupo(probs_subset, y_subset, clases)
+    ap_distancia[[dist]] <- ap_vals
+  }
+}
+
+# Convertir a data.frame
+ap_dist_df <- as.data.frame(do.call(rbind, ap_distancia))
+ap_dist_df$Distancia <- rownames(ap_dist_df)
+rownames(ap_dist_df) <- NULL
+ap_dist_df <- ap_dist_df[, c("Distancia", clases)]
+print(ap_dist_df)
+
+```
+
+### AP por clase según azimuth (evaluando con validación)
+
+```{r, warning=FALSE, message=FALSE}
+# Crear lista para AP por azimuth
+ap_azimuth <- list()
+
+for (az in c("centrado", "lateral")) {
+  idx <- which(valid_scaled$azimuth_cat == az)
+  
+  if (length(idx) > 0) {
+    probs_subset <- pred_valid[idx, ]      # usamos el set de validación
+    y_subset <- valid_scaled$clase[idx]
+    
+    ap_vals <- calcular_AP_grupo(probs_subset, y_subset, clases)
+    ap_azimuth[[az]] <- ap_vals
+  }
+}
+
+# Convertir a data.frame
+ap_azimuth_df <- as.data.frame(do.call(rbind, ap_azimuth))
+ap_azimuth_df$Azimuth <- rownames(ap_azimuth_df)
+rownames(ap_azimuth_df) <- NULL
+ap_azimuth_df <- ap_azimuth_df[, c("Azimuth", clases)]
+print(ap_azimuth_df)
+
+```
+
+### Dataframes para ggplot
+
+```{r, warning=FALSE, message=FALSE}
+
+# AP por distancia
+ap_dist_long <- ap_dist_df %>%
+  pivot_longer(cols = -Distancia, names_to = "Clase", values_to = "AP")
+
+# AP por azimuth
+ap_azimuth_long <- ap_azimuth_df %>%
+  pivot_longer(cols = -Azimuth, names_to = "Clase", values_to = "AP")
+
+```
+
+### Gráfico AP vs Distancia
+
+```{r, warning=FALSE, message=FALSE}
+
+ggplot(ap_dist_long, aes(x = Clase, y = AP, fill = Distancia)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(title = "Average Precision (AP) por clase según Distancia",
+       x = "Clase",
+       y = "AP") +
+  theme_minimal(base_size = 13) +
+  scale_fill_manual(values = c("corta" = "#1f77b4", "larga" = "#ff7f0e"))
+
+```
+
+```{r, warning=FALSE, message=FALSE}
+
+ggplot(ap_azimuth_long, aes(x = Clase, y = AP, fill = Azimuth)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(title = "Average Precision (AP) por clase según Azimuth",
+       x = "Clase",
+       y = "AP") +
+  theme_minimal(base_size = 13) +
+  scale_fill_manual(values = c("centrado" = "#2ca02c", "lateral" = "#d62728"))
+
+
+```
+
+```{r, warning=FALSE, message=FALSE}
+
+# Diferencias AP por clase - distancia
+ap_diff_dist <- ap_dist_long %>%
+  pivot_wider(names_from = Distancia, values_from = AP) %>%
+  mutate(Distancia_diff = corta - larga) %>%
+  select(Clase, Distancia_diff)
+
+# Diferencias AP por clase - azimuth
+ap_diff_az <- ap_azimuth_long %>%
+  pivot_wider(names_from = Azimuth, values_from = AP) %>%
+  mutate(Azimuth_diff = centrado - lateral) %>%
+  select(Clase, Azimuth_diff)
+
+# Combinar ambas diferencias
+ap_diff <- ap_diff_dist %>%
+  left_join(ap_diff_az, by = "Clase") %>%
+  pivot_longer(cols = c("Distancia_diff", "Azimuth_diff"),
+               names_to = "Tipo", values_to = "AP_diff") %>%
+  mutate(Tipo = ifelse(Tipo == "Distancia_diff", "Distancia", "Azimuth"))
+```
+
+```{r, warning=FALSE, message=FALSE}
+
+ap_diff$Clase <- factor(ap_diff$Clase, levels = c("0", "1", "5", "7", "10", "11"))
+
+```
+
+```{r, fig.width=15, fig.height=6, warning=FALSE, message=FALSE}
+
+ggplot(ap_diff, aes(x = Clase, y = AP_diff, fill = Tipo)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.4), width = 0.4) +
+  labs(title = "Diferencia de AP por clase",
+       x = "Clase",
+       y = "AP corta-larga / AP centrado-lateral") +
+  scale_fill_manual(values = c("Distancia" = "#1f77b4", "Azimuth" = "#2ca02c")) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(hjust = 1))
+
+```
+
+Si bien teóricamente se esperaría que el AP fuera mayor para distancias cortas y azimuth centrados, la observación de los resultados muestra que algunas clases presentan mejor desempeño en distancias largas o ángulos laterales. Un motivo para esto puede ser que hayan más ejemplos de ciertas clases en rangos largos o azimuth lateral, lo que favorece la predicción de esas clases allí.
+
+Ejemplo: si hay más “vehículos grandes” detectados en azimuth laterales, el modelo aprende mejor en esas condiciones.
+
+```{r, warning=FALSE, message=FALSE}
+
+# Definir bin_width para escalar la densidad a la frecuencia
+bin_width_range <- diff(range(X_train[idx_sample, "range_sc"], na.rm = TRUE)) / 50
+
+ggplot(train_scaled, aes(x = X_train[idx_sample, "range_sc"], fill = clase, color = clase)) +
+  geom_histogram(position = "identity", alpha = 0.3, bins = 50) +
+  geom_density(aes(y = ..count.. * bin_width_range), size = 1.2, fill = NA) +
+  labs(title = "Distribución de las clases según distancia (range_sc)",
+       x = "Distancia [m]",
+       y = "Frecuencia") +
+  theme_minimal(base_size = 13) +
+  scale_fill_brewer(palette = "Set3") +
+  scale_color_brewer(palette = "Set3")
+
+```
+
+```{r, warning=FALSE, message=FALSE}
+bin_width_az <- diff(range(X_train[idx_sample, "azimuth_sc"], na.rm = TRUE)) / 50
+
+ggplot(train_scaled, aes(x = X_train[idx_sample, "azimuth_sc"], fill = clase, color = clase)) +
+  geom_histogram(position = "identity", alpha = 0.3, bins = 50) +
+  geom_density(aes(y = ..count.. * bin_width_az), size = 1.2, fill = NA) +
+  labs(title = "Distribución de las clases según azimuth (azimuth_sc)",
+       x = "Azimuth [rad]",
+       y = "Frecuencia") +
+  theme_minimal(base_size = 13) +
+  scale_fill_brewer(palette = "Set3") +
+  scale_color_brewer(palette = "Set3")
+```
+
+La clase 1 parece estar uniformemente distribuida en la grafica de distribución de la variable Distancia, mientras que la clase 11 en la variable Azimuth. Veamos como afecta que la distancia sea corta-larga a la primera y el azimuth centrado o lateral a la segunda.
+
+```{r, warning=FALSE, message=FALSE}
+
+# Extraer AP
+ap_az_clase11 <- ap_diff %>%
+  filter(Clase == "11" & Tipo == "Azimuth") %>%
+  pull(AP_diff)
+
+ap_dist_clase1 <- ap_diff %>%
+  filter(Clase == "1" & Tipo == "Distancia") %>%
+  pull(AP_diff)
+
+# Crear data.frame para plot
+ap_plot <- data.frame(
+  Clase = c("Clase 1", "Clase 11"),
+  Tipo = c("Distancia", "Azimuth"),
+  AP_diff = c(ap_dist_clase1, ap_az_clase11)
+)
+
+# Plot de barras
+ggplot(ap_plot, aes(x = Clase, y = AP_diff, fill = Tipo)) +
+  geom_bar(stat = "identity", width = 0.5) +
+  labs(title = "AP de diferencia seleccionada por clase",
+       x = "Clase",
+       y = "Diferencia de AP") +
+  scale_fill_manual(values = c("Distancia" = "#1f77b4", "Azimuth" = "#2ca02c")) +
+  theme_minimal(base_size = 13)
+
+```
+
+En general, para la mayoría de las clases no se observa un patrón claro de mejora de AP según la distancia o el azimuth; los resultados son variables y dependen de la distribución de las detecciones en el dataset. Sin embargo, en el caso de la clase 1 y la clase 11, cuyas distribuciones eran relativamente uniformes en sus respectivas variables, el AP se comporta de manera más predecible: la clase 1 alcanza un AP mayor a distancias cortas, mientras que la clase 11 alcanza un AP mayor en azimuth centrados. Esto sugiere que la relación entre la variable de posición y el desempeño del clasificador se hace más evidente cuando la distribución de las detecciones es equilibrada.
+
+## Parte 7: Precision-Recall
+
+```{r, warning=FALSE, message=FALSE}
+
+# Etiqueta binaria: clase 7 vs resto
+y_true <- ifelse(train_scaled$clase == 7, 1, 0)
+
+# Probabilidad predicha de clase 7
+scores <- pred_train[, "7"]
+
+# Calcular curva Precision-Recall
+pr <- pr.curve(scores.class0 = scores, weights.class0 = y_true, curve = TRUE)
+
+# Graficar con límites de eje x de 0 a 1
+plot(pr, main = "Curva Precision-Recall - Clase 7 (Train)", 
+     xlab = "Recall", ylab = "Precision", col = "blue", lwd = 2,
+     xlim = c(0, 1), ylim = c(0.7, 1))
+
+```
+
+```{r, warning=FALSE, message=FALSE}
+# Etiqueta binaria: clase 7 vs resto
+y_true_val <- ifelse(valid_scaled$clase == 7, 1, 0)
+
+# Probabilidad predicha de clase 7
+scores_val <- pred_valid[, "7"]
+
+# Calcular curva Precision-Recall
+pr_val <- pr.curve(scores.class0 = scores_val, weights.class0 = y_true_val, curve = TRUE)
+
+# Graficar con límites de 0 a 1
+plot(pr_val, main = "Curva Precision-Recall - Clase 7 (Validación)",
+     xlab = "Recall", ylab = "Precision",
+     col = "darkorange", lwd = 2,
+     xlim = c(0, 1), ylim = c(0.35, 1))
+```
+
+### Definición del umbral
+
+```{r, warning=FALSE, message=FALSE}
+
+threshold_opt <- 0.9
+cat("Umbral fijo:", threshold_opt, "\n")
+
+```
+
+```{r, warning=FALSE, message=FALSE}
+
+# 1. Graficar primero la curva
+plot(pr, main = "Curva Precision–Recall",
+     xlab = "Recall", ylab = "Precision",
+     col = "blue", lwd = 2,
+     xlim = c(0, 1), ylim = c(0.7, 1))
+
+# 2. Después agregar el punto del umbral
+threshold_opt <- 0.9
+df_pr_train <- as.data.frame(pr$curve)
+colnames(df_pr_train) <- c("Recall", "Precision", "Threshold")
+
+punto_train <- df_pr_train[which.min(abs(df_pr_train$Threshold - threshold_opt)), ]
+
+points(punto_train$Recall, punto_train$Precision, col = "red", pch = 19, cex = 1.5)
+text(punto_train$Recall, punto_train$Precision + 0.015,
+     labels = paste0("Umbral = ", threshold_opt),
+     col = "red", cex = 0.5)
+
+```
+
+```{r, warning=FALSE, message=FALSE}
+
+# Curva Precision–Recall - Validación
+plot(pr_val, main = "Curva Precision–Recall - Validación",
+     xlab = "Recall", ylab = "Precision",
+     col = "darkorange", lwd = 2,
+     xlim = c(0, 1), ylim = c(0.35, 1))
+
+# Umbral fijo
+threshold_opt <- 0.9
+
+# Extraer los datos de la curva
+df_pr_val <- as.data.frame(pr_val$curve)
+colnames(df_pr_val) <- c("Recall", "Precision", "Threshold")
+
+# Buscar el punto más cercano al umbral
+punto_val <- df_pr_val[which.min(abs(df_pr_val$Threshold - threshold_opt)), ]
+
+# Marcar el punto del umbral
+points(punto_val$Recall, punto_val$Precision, col = "red", pch = 19, cex = 1.5)
+text(punto_val$Recall, punto_val$Precision + 0.05,
+     labels = paste0("Umbral = ", threshold_opt),
+     col = "red", cex = 0.5)  # tamaño reducido del label
+
+
+```
+
+### Evualación en TRAIN
+
+```{r, warning=FALSE, message=FALSE}
+
+pred_bin_train <- ifelse(scores >= threshold_opt, 1, 0)
+
+TP_train <- sum(pred_bin_train == 1 & y_true == 1)
+FP_train <- sum(pred_bin_train == 1 & y_true == 0)
+FN_train <- sum(pred_bin_train == 0 & y_true == 1)
+
+precision_train <- ifelse((TP_train + FP_train) > 0, TP_train / (TP_train + FP_train), NA)
+recall_train <- ifelse((TP_train + FN_train) > 0, TP_train / (TP_train + FN_train), NA)
+
+cat("Precisión (train):", round(precision_train, 3), "\n")
+cat("Recall (train):", round(recall_train, 3), "\n")
+
+```
+
+### Evaluación en TEST
+
+```{r, warning=FALSE, message=FALSE}
+
+pred_bin_val <- ifelse(scores_val >= threshold_opt, 1, 0)
+
+TP_val <- sum(pred_bin_val == 1 & y_true_val == 1)
+FP_val <- sum(pred_bin_val == 1 & y_true_val == 0)
+FN_val <- sum(pred_bin_val == 0 & y_true_val == 1)
+
+precision_val <- ifelse((TP_val + FP_val) > 0, TP_val / (TP_val + FP_val), NA)
+recall_val <- ifelse((TP_val + FN_val) > 0, TP_val / (TP_val + FN_val), NA)
+
+cat("\n--- Resultados en validación ---\n")
+cat("Precisión (val):", round(precision_val, 3), "\n")
+cat("Recall (val):", round(recall_val, 3), "\n")
+
+```
+
+### Comparación Visual
+
+```{r, warning=FALSE, message=FALSE}
+
+df_comp <- data.frame(
+  Conjunto = c("Entrenamiento", "Validación"),
+  Precision = c(precision_train, precision_val),
+  Recall = c(recall_train, recall_val)
+)
+
+ggplot(df_comp, aes(x = Conjunto)) +
+  geom_bar(aes(y = Precision, fill = "Precisión"), stat = "identity", position = "dodge") +
+  geom_bar(aes(y = Recall, fill = "Recall"), stat = "identity", position = "dodge") +
+  ylim(0, 1) +
+  labs(
+    title = paste("Precisión y Recall con umbral =", threshold_opt),
+    subtitle = "Clase 7 (persona) vs resto — Prioridad: alta precisión",
+    y = "Valor",
+    x = ""
+  ) +
+  scale_fill_manual(values = c("Precisión" = "steelblue", "Recall" = "darkorange")) +
+  theme_minimal(base_size = 14)
+
+```
+
+El modelo se comporta parecido en train y test, aunque baja un poco el rendimiento en validación. Mantiene buena precisión, pero pierde algo de recall, lo que indica un leve sobreajuste. En general, el desempeño sigue siendo bueno.
+
+### Punto de operación — Clase Persona (7) vs. resto
+
+Se fija un umbral de **0.9** priorizando la precisión del modelo.
+
+| Métrica   | Entrenamiento | Validación |
+|:---------:|:-------------:|:----------:|
+| Precisión | 0.989         | 0.873      |
+| Recall    | 0.939         | 0.773      |
+
+Los resultados son similares entre train y validación, aunque con una caída moderada en validación. El modelo mantiene una precisión alta (0.87), lo que era el objetivo prioritario, a costa de perder algo de recall. El leve sobreajuste observado es coherente con el uso de un muestreo reducido para el entrenamiento.
